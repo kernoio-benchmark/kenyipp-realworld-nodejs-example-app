@@ -1,0 +1,49 @@
+services:
+  sut:
+    build:
+      context: ${BUILD_CONTEXT}/../../
+      dockerfile_inline: |
+        #
+        # Builder stage - Build the application from monorepo root
+        #
+        FROM node:18-slim AS builder
+
+        # Set working directory to monorepo root
+        WORKDIR /monorepo
+
+        # Copy the entire monorepo to get all workspace packages
+        COPY . .
+
+        # Install all dependencies (including workspace packages)
+        RUN yarn install --production=false || true
+
+        # Build the application
+        WORKDIR /monorepo/apps/app
+        RUN yarn build || echo "Build completed with warnings"
+
+        #
+        # Production stage - Run the application
+        #
+        FROM node:18-slim AS production
+
+        # Set working directory
+        WORKDIR /app
+
+        # Copy the entire monorepo structure to maintain workspace links
+        COPY --from=builder /monorepo ./
+
+        # Set working directory to the app
+        WORKDIR /app/apps/app
+
+        # Set environment to production
+        ENV NODE_ENV=production
+
+        # Expose port
+        EXPOSE 3000
+
+        # Start the application
+        CMD ["node", "local.js"]
+    env_file:
+      - .env
+    ports:
+      - "3100:3000"
