@@ -1,0 +1,102 @@
+services:
+  mysql:
+    image: mysql:9.1.0
+    pull_policy: missing
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    environment:
+      - MYSQL_ROOT_PASSWORD=root_password
+      - MYSQL_USER=conduit_user
+      - MYSQL_PASSWORD=conduit_password
+      - MYSQL_DATABASE=conduit_db
+    ports:
+      - "3306"
+    tmpfs:
+      - /var/lib/mysql
+    labels:
+      - external-url=mysql://conduit_user:conduit_password@localhost:{{PORT}}/conduit_db
+    healthcheck:
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      test:
+        - CMD-SHELL
+        - mysqladmin ping -h 127.0.0.1 -P 3306 -u conduit_user --password=conduit_password
+
+  sut:
+    build:
+      context: ${BUILD_CONTEXT}
+      args:
+        WORKSPACE_SCOPE: "@conduit/article"
+      dockerfile_inline: |
+        #
+        # Base image for the server
+        #
+        FROM node:18 AS base
+
+        ARG WORKSPACE_SCOPE=@conduit/article
+
+        # Set working directory
+        WORKDIR /app
+        RUN yarn global add turbo
+
+        # Copy the project files
+        COPY . .
+
+        # Use the build argument in the turbo prune command
+        RUN turbo prune --scope=@conduit/article --docker
+
+        #
+        # Installer image
+        # Add lockfile and package.json's of isolated sub-workspace
+        #
+        FROM node:18 AS installer
+
+        ARG WORKSPACE_SCOPE=@conduit/article
+
+        # Set working directory
+        WORKDIR /app
+
+        # Copy necessary files to the installer stage
+        COPY .gitignore .gitignore
+        COPY --from=base /app/out/json/ .
+        COPY --from=base /app/out/yarn.lock ./yarn.lock
+
+        # Install dependencies
+        RUN yarn install --frozen-lockfile
+
+        # Build the project using the variable scope
+        COPY --from=base /app/out/full/ .
+        RUN yarn global add turbo
+        RUN turbo run build --filter=@conduit/article...
+
+        #
+        # Runner image - production runtime
+        #
+        FROM node:18-slim AS runner
+
+        ARG WORKSPACE_SCOPE=@conduit/article
+
+        # Set working directory
+        WORKDIR /app
+
+        # Copy the entire built workspace with all dependencies
+        # This includes all internal packages and node_modules
+        COPY --from=installer /app .
+
+        # Expose the application port (default Express port)
+        EXPOSE 3000
+
+        # Set the default command to run the application
+        CMD ["node", "apps/article/local.js"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    env_file:
+      - .env
+    ports:
+      - "3000"
