@@ -1,0 +1,99 @@
+services:
+  mysql:
+    image: mysql:8.4
+    pull_policy: missing
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+    environment:
+      - MYSQL_ROOT_PASSWORD=root_password
+      - MYSQL_USER=mysql
+      - MYSQL_PASSWORD=mysql
+      - MYSQL_DATABASE=conduit
+    ports:
+      - "3306"
+    healthcheck:
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      test:
+        - CMD-SHELL
+        - mysqladmin ping -h 127.0.0.1 -P 3306 -u mysql --password=mysql
+
+  sut:
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      NODE_ENV: ci
+      NODE_CONFIG: '{"nodeEnv":"ci","mode":"local","domain":"localhost","auth":{"expiresIn":"1d","jwtSecret":"how_do_you_turn_this_on"},"database":{"conduit":{"host":"mysql","port":"3306","user":"mysql","password":"mysql","database":"conduit"}}}'
+    build:
+      context: ${BUILD_CONTEXT}
+      args:
+        WORKSPACE_SCOPE: "@conduit/local"
+      dockerfile_inline: |
+        #
+        # Base image for the server
+        #
+        FROM node:18 AS base
+
+        ARG WORKSPACE_SCOPE=@conduit/local
+
+        # Set working directory
+        WORKDIR /app
+        RUN yarn global add turbo
+
+        # Copy the project files
+        COPY . .
+
+        # Use the build argument in the turbo prune command
+        RUN turbo prune --scope=$$WORKSPACE_SCOPE --docker
+
+        #
+        # Installer image
+        # Add lockfile and package.json's of isolated sub-workspace
+        #
+        FROM node:18-slim AS installer
+
+        ARG WORKSPACE_SCOPE=@conduit/local
+
+        # Set working directory
+        WORKDIR /app
+
+        # Copy necessary files to the installer stage
+        COPY .gitignore .gitignore
+        COPY --from=base /app/out/json/ .
+        COPY --from=base /app/out/yarn.lock ./yarn.lock
+
+        # Install dependencies
+        RUN yarn install
+
+        # Build the project using the variable scope
+        COPY --from=base /app/out/full/ .
+        RUN yarn global add turbo && turbo run build --filter="$${WORKSPACE_SCOPE}..."
+
+        #
+        # Runner image
+        # Copy built application and run it
+        #
+        FROM node:18-slim AS runner
+
+        # Set working directory
+        WORKDIR /app
+
+        # Copy necessary files from installer
+        COPY --from=installer /app .
+
+        # Set NODE_CONFIG_DIR environment variable to point to the config directory
+        ENV NODE_CONFIG_DIR=/app/config
+
+        # Expose port (default Express port)
+        EXPOSE 3000
+
+        # Run the application
+        CMD ["node", "apps/local/local.js"]
+    ports:
+      - "3000"
