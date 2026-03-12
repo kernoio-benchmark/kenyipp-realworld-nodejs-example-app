@@ -1,0 +1,106 @@
+services:
+  mysql:
+    image: mysql:9.1.0
+    pull_policy: missing
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+    ports:
+      - "3306"
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      test:
+        - CMD-SHELL
+        - mysqladmin ping -h 127.0.0.1 -P 3306 -u ${MYSQL_USER} --password=${MYSQL_PASSWORD}
+
+  sut:
+    build:
+      context: ${BUILD_CONTEXT}
+      args:
+        WORKSPACE_SCOPE: "@conduit/app"
+      dockerfile_inline: |
+        #
+        # Base image for the server
+        #
+        FROM node:18 AS base
+        
+        ARG WORKSPACE_SCOPE
+        
+        # Set working directory
+        WORKDIR /app
+        RUN yarn global add turbo
+        
+        # Copy the project files
+        COPY . .
+        
+        # Use the build argument in the turbo prune command
+        RUN turbo prune --scope=$${WORKSPACE_SCOPE} --docker
+        
+        #
+        # Installer image
+        # Add lockfile and package.json's of isolated sub-workspace
+        #
+        FROM node:18 AS installer
+        
+        ARG WORKSPACE_SCOPE
+        
+        # Set working directory
+        WORKDIR /app
+        
+        # Install turbo globally
+        RUN yarn global add turbo
+        
+        # Copy necessary files to the installer stage
+        COPY .gitignore .gitignore
+        COPY --from=base /app/out/json/ .
+        COPY --from=base /app/out/yarn.lock ./yarn.lock
+        
+        # Install dependencies
+        RUN yarn install
+        
+        # Build the project using the variable scope
+        COPY --from=base /app/out/full/ .
+        RUN turbo run build --filter=$${WORKSPACE_SCOPE}...
+        
+        #
+        # Runner image - production runtime
+        #
+        FROM node:18-slim AS runner
+        
+        ARG WORKSPACE_SCOPE
+        
+        # Set working directory
+        WORKDIR /app
+        
+        # Set production environment
+        ENV NODE_ENV=production
+        
+        # Copy built application and dependencies from installer
+        COPY --from=installer /app .
+        
+        # Expose port (default Express port)
+        EXPOSE 3000
+        
+        # Set the default command to run the application
+        CMD node apps/app/local.js
+    depends_on:
+      mysql:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - ./config:/app/config:ro
+    ports:
+      - "3000"
