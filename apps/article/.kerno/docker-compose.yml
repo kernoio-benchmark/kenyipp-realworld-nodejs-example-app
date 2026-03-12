@@ -1,0 +1,117 @@
+services:
+  mysql:
+    image: mysql:9.1.0
+    pull_policy: missing
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+    environment:
+      - MYSQL_ROOT_PASSWORD=root_password
+      - MYSQL_USER=conduit_user
+      - MYSQL_PASSWORD=conduit_password
+      - MYSQL_DATABASE=conduit_db
+    ports:
+      - "3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      test:
+        - CMD-SHELL
+        - mysqladmin ping -h 127.0.0.1 -P 3306 -u conduit_user --password=conduit_password
+
+  sut:
+    build:
+      context: ${BUILD_CONTEXT}
+      args:
+        WORKSPACE_SCOPE: "@conduit/article"
+      dockerfile_inline: |
+        #
+        # Base image for the server
+        #
+        FROM node:18 AS base
+
+        ARG WORKSPACE_SCOPE=@conduit/article
+
+        # Set working directory
+        WORKDIR /app
+        RUN yarn global add turbo
+
+        # Copy the project files
+        COPY . .
+
+        # Use the build argument in the turbo prune command
+        RUN turbo prune --scope=$$WORKSPACE_SCOPE --docker
+
+        #
+        # Installer image
+        # Add lockfile and package.json's of isolated sub-workspace
+        #
+        FROM node:18 AS installer
+
+        ARG WORKSPACE_SCOPE=@conduit/article
+
+        # Set working directory
+        WORKDIR /app
+
+        # Install turbo globally
+        RUN yarn global add turbo
+
+        # Copy necessary files to the installer stage
+        COPY .gitignore .gitignore
+        COPY --from=base /app/out/json/ .
+        COPY --from=base /app/out/yarn.lock ./yarn.lock
+
+        # Install dependencies
+        RUN yarn install
+
+        # Build the project using the variable scope
+        COPY --from=base /app/out/full/ .
+        RUN turbo run build --filter=$$WORKSPACE_SCOPE...
+
+        #
+        # Runtime image
+        # Production-ready minimal image
+        #
+        FROM node:18-slim AS runtime
+
+        ARG WORKSPACE_SCOPE=@conduit/article
+
+        # Set working directory
+        WORKDIR /app
+
+        # Set NODE_ENV to production
+        ENV NODE_ENV=production
+        ENV NODE_CONFIG_DIR=/app/config
+
+        # Copy only production dependencies and built artifacts
+        COPY --from=installer /app/package.json ./package.json
+        COPY --from=installer /app/yarn.lock ./yarn.lock
+        COPY --from=installer /app/node_modules ./node_modules
+        COPY --from=installer /app/packages ./packages
+        COPY --from=installer /app/apps/article ./apps/article
+        COPY --from=base /app/config ./config
+        
+        # Create production config file
+        RUN echo '{"nodeEnv":"prod","mode":"local","domain":"localhost","auth":{"expiresIn":"1d","jwtSecret":"placeholder"},"aws":{"accountId":"","region":"us-east-1"},"database":{"conduit":{"host":"mysql","port":3306,"user":"conduit_user","password":"conduit_password","database":"conduit_db"}}}' > /app/config/production.json
+
+        # Expose the port (default Express port)
+        EXPOSE 3000
+
+        # Start the application from the article app directory
+        CMD ["node", "apps/article/local.js"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    env_file:
+      - .env
+    ports:
+      - "3000"
+
+volumes:
+  mysql-data:
